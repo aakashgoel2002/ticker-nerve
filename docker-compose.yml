@@ -1,0 +1,390 @@
+# ============================================================================
+#  ticker-nerve — Docker Compose
+#  Services: Airflow (webserver · scheduler · worker), Kafka, PostgreSQL,
+#            Airbyte (db · temporal · bootloader · worker · server · webapp)
+# ============================================================================
+
+x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.10.5}
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres:5432/${POSTGRES_DB:-airflow}
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # Kafka connection (available inside DAGs via Variable / Connection)
+    KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./dbt:/opt/airflow/dbt
+    - ./scripts:/opt/airflow/scripts
+    - ./app:/opt/airflow/app
+    - airflow-logs:/opt/airflow/logs
+    - airflow-plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+# ============================================================================
+services:
+  # ── PostgreSQL (Airflow metadata DB) ──────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: ticker-nerve-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-airflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis (Celery broker for Airflow) ─────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ticker-nerve-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Airflow — Init (one-shot: creates DB tables + admin user) ─────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: ticker-nerve-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Run DB migrations
+        airflow db migrate
+        # Create default admin user (idempotent)
+        airflow users create \
+          --username ${_AIRFLOW_WWW_USER_USERNAME:-airflow} \
+          --password ${_AIRFLOW_WWW_USER_PASSWORD:-airflow} \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+        echo "✅  Airflow init complete"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+    restart: "no"
+    depends_on:
+      <<: *airflow-common-depends-on
+
+  # ── Airflow — Webserver ───────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: ticker-nerve-airflow-webserver
+    command: webserver
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Airflow — Scheduler ──────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: ticker-nerve-airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob", "--hostname", "$${HOSTNAME}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Airflow — Celery Worker ──────────────────────────────────────────────
+  airflow-worker:
+    <<: *airflow-common
+    container_name: ticker-nerve-airflow-worker
+    command: celery worker
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Zookeeper (Kafka dependency) ─────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.1
+    container_name: ticker-nerve-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=ruok,srvr"
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | bash -c 'exec 3<>/dev/tcp/localhost/2181 && cat >&3 && cat <&3' | grep imok"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  # ── Kafka Broker ─────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: ticker-nerve-kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:${KAFKA_BROKER_PORT:-9092}
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "${KAFKA_BROKER_PORT:-9092}:9092"
+      - "${KAFKA_BROKER_INTERNAL_PORT:-29092}:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Airbyte — Database (separate from Airflow postgres) ──────────────────
+  airbyte-db:
+    image: postgres:13-alpine
+    container_name: ticker-nerve-airbyte-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${AIRBYTE_DATABASE_USER:-airbyte}
+      POSTGRES_PASSWORD: ${AIRBYTE_DATABASE_PASSWORD:-airbyte}
+      POSTGRES_DB: airbyte
+    volumes:
+      - airbyte-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRBYTE_DATABASE_USER:-airbyte}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Airbyte — Temporal (workflow engine) ─────────────────────────────────
+  airbyte-temporal:
+    image: temporalio/auto-setup:1.20.0
+    container_name: ticker-nerve-airbyte-temporal
+    restart: unless-stopped
+    depends_on:
+      airbyte-db:
+        condition: service_healthy
+    environment:
+      DB: postgresql
+      DB_PORT: "5432"
+      POSTGRES_USER: ${AIRBYTE_DATABASE_USER:-airbyte}
+      POSTGRES_PWD: ${AIRBYTE_DATABASE_PASSWORD:-airbyte}
+      POSTGRES_SEEDS: airbyte-db
+    ports:
+      - "${AIRBYTE_TEMPORAL_PORT:-7233}:7233"
+
+  # ── Airbyte — Bootloader (one-shot DB migration) ──────────────────────────
+  airbyte-bootloader:
+    image: airbyte/bootloader:${AIRBYTE_VERSION:-0.63.4}
+    container_name: ticker-nerve-airbyte-bootloader
+    restart: "no"
+    environment:
+      AIRBYTE_VERSION: ${AIRBYTE_VERSION:-0.63.4}
+      DATABASE_URL: jdbc:postgresql://airbyte-db:5432/airbyte
+      DATABASE_HOST: airbyte-db
+      DATABASE_PORT: "5432"
+      DATABASE_USER: ${AIRBYTE_DATABASE_USER:-airbyte}
+      DATABASE_PASSWORD: ${AIRBYTE_DATABASE_PASSWORD:-airbyte}
+      DATABASE_DB: airbyte
+      CONFIG_ROOT: /data
+      LOG_LEVEL: INFO
+    depends_on:
+      airbyte-db:
+        condition: service_healthy
+
+  # ── Airbyte — Worker ─────────────────────────────────────────────────────
+  airbyte-worker:
+    image: airbyte/worker:${AIRBYTE_VERSION:-0.63.4}
+    container_name: ticker-nerve-airbyte-worker
+    restart: unless-stopped
+    environment:
+      AIRBYTE_VERSION: ${AIRBYTE_VERSION:-0.63.4}
+      DATABASE_URL: jdbc:postgresql://airbyte-db:5432/airbyte
+      DATABASE_HOST: airbyte-db
+      DATABASE_PORT: "5432"
+      DATABASE_USER: ${AIRBYTE_DATABASE_USER:-airbyte}
+      DATABASE_PASSWORD: ${AIRBYTE_DATABASE_PASSWORD:-airbyte}
+      DATABASE_DB: airbyte
+      CONFIG_ROOT: /data
+      WORKSPACE_ROOT: /tmp/workspace
+      TEMPORAL_HOST: airbyte-temporal:7233
+      LOCAL_ROOT: /tmp/airbyte_local
+      WEBAPP_URL: http://airbyte-webapp:80
+      LOG_LEVEL: INFO
+      TRACKING_STRATEGY: logging
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - airbyte-workspace:/tmp/workspace
+      - airbyte-data:/data
+      - /tmp/airbyte_local:/tmp/airbyte_local
+    depends_on:
+      airbyte-db:
+        condition: service_healthy
+      airbyte-temporal:
+        condition: service_started
+      airbyte-bootloader:
+        condition: service_completed_successfully
+
+  # ── Airbyte — Server ─────────────────────────────────────────────────────
+  airbyte-server:
+    image: airbyte/server:${AIRBYTE_VERSION:-0.63.4}
+    container_name: ticker-nerve-airbyte-server
+    restart: unless-stopped
+    environment:
+      AIRBYTE_VERSION: ${AIRBYTE_VERSION:-0.63.4}
+      DATABASE_URL: jdbc:postgresql://airbyte-db:5432/airbyte
+      DATABASE_HOST: airbyte-db
+      DATABASE_PORT: "5432"
+      DATABASE_USER: ${AIRBYTE_DATABASE_USER:-airbyte}
+      DATABASE_PASSWORD: ${AIRBYTE_DATABASE_PASSWORD:-airbyte}
+      DATABASE_DB: airbyte
+      CONFIG_ROOT: /data
+      WORKSPACE_ROOT: /tmp/workspace
+      TEMPORAL_HOST: airbyte-temporal:7233
+      LOG_LEVEL: INFO
+      TRACKING_STRATEGY: logging
+    volumes:
+      - airbyte-data:/data
+      - airbyte-workspace:/tmp/workspace
+    ports:
+      - "${AIRBYTE_SERVER_PORT:-8001}:8001"
+    depends_on:
+      airbyte-db:
+        condition: service_healthy
+      airbyte-temporal:
+        condition: service_started
+      airbyte-bootloader:
+        condition: service_completed_successfully
+
+  # ── Airbyte — Keycloak (auth) ─────────────────────────────────────────────
+  airbyte-keycloak:
+    image: airbyte/keycloak:${AIRBYTE_VERSION:-0.63.4}
+    container_name: ticker-nerve-airbyte-keycloak
+    restart: unless-stopped
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN_USER:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://airbyte-db:5432/airbyte
+      KC_DB_USERNAME: ${AIRBYTE_DATABASE_USER:-airbyte}
+      KC_DB_PASSWORD: ${AIRBYTE_DATABASE_PASSWORD:-airbyte}
+      KC_HTTP_RELATIVE_PATH: /auth
+    ports:
+      - "${AIRBYTE_KEYCLOAK_PORT:-8180}:8080"
+    depends_on:
+      airbyte-db:
+        condition: service_healthy
+      airbyte-bootloader:
+        condition: service_completed_successfully
+
+  # ── Airbyte — Connector Builder Server ───────────────────────────────────
+  airbyte-connector-builder-server:
+    image: airbyte/connector-builder-server:${AIRBYTE_VERSION:-0.63.4}
+    container_name: ticker-nerve-airbyte-connector-builder-server
+    restart: unless-stopped
+    environment:
+      AIRBYTE_VERSION: ${AIRBYTE_VERSION:-0.63.4}
+    ports:
+      - "${AIRBYTE_CONNECTOR_BUILDER_PORT:-8003}:80"
+    depends_on:
+      - airbyte-server
+
+  # ── Airbyte — Webapp ─────────────────────────────────────────────────────
+  airbyte-webapp:
+    image: airbyte/webapp:${AIRBYTE_VERSION:-0.63.4}
+    container_name: ticker-nerve-airbyte-webapp
+    restart: unless-stopped
+    environment:
+      AIRBYTE_SERVER_HOST: airbyte-server:8001
+      AIRBYTE_SERVER_PORT: "8001"
+      AIRBYTE_SERVER_PROTO: http
+      CONNECTOR_BUILDER_API_HOST: airbyte-connector-builder-server
+      KEYCLOAK_INTERNAL_HOST: airbyte-keycloak:8080
+      TRACKING_STRATEGY: logging
+    ports:
+      - "${AIRBYTE_WEBAPP_PORT:-8000}:80"
+    depends_on:
+      - airbyte-server
+      - airbyte-connector-builder-server
+      - airbyte-keycloak
+
+# ============================================================================
+volumes:
+  postgres-data:
+    driver: local
+  airflow-logs:
+    driver: local
+  airflow-plugins:
+    driver: local
+  zookeeper-data:
+    driver: local
+  zookeeper-logs:
+    driver: local
+  kafka-data:
+    driver: local
+  airbyte-db-data:
+    driver: local
+  airbyte-data:
+    driver: local
+  airbyte-workspace:
+    driver: local
